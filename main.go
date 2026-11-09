@@ -137,9 +137,9 @@ func redirectHandler(w http.ResponseWriter, r *http.Request) {
 	finalURL := targetURL
 	if isBlocked && blockURL != "" {
 		finalURL = blockURL
-		log.Printf("[BLOCK] HTTP trigger function processing request for IP filter. %s\n", ip)
+		log.Printf("[BLOCK] %s function processing request for IP filter. %s\n", finalURL, ip)
 	} else {
-		log.Printf("[PASS] HTTP trigger function processing request for IP filter. %s\n", ip)
+		log.Printf("[PASS] %s function processing request for IP filter. %s\n", finalURL, ip)
 	}
 
 	// Teruskan searchParams (query string) jika ada
