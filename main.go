@@ -169,7 +169,11 @@ func editHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if apikey != config.APIKey {
+	config.mu.RLock()
+	validKey := config.APIKey
+	config.mu.RUnlock()
+
+	if apikey != validKey {
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]string{"error": "API Key tidak valid"})
 		return
