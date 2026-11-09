@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/ini.v1"
 )
@@ -15,6 +21,7 @@ import (
 type AppConfig struct {
 	APIKey         string
 	TargetRedirect string
+	BlockRedirect  string
 	mu             sync.RWMutex
 }
 
@@ -24,13 +31,11 @@ const configFile = "settings.ini"
 
 // loadConfig membaca target dari file INI dan API Key dari Environment Variable
 func loadConfig() {
-	// Load API Key dari env (dieksekusi sekali saat start)
 	config.APIKey = os.Getenv("API_KEY")
 	if config.APIKey == "" {
 		log.Fatal("Environment variable API_KEY belum di-set!")
 	}
 
-	// Load Target Redirect dari settings.ini
 	cfg, err := ini.Load(configFile)
 	if err != nil {
 		log.Fatalf("Gagal membaca %s: %v", configFile, err)
@@ -39,34 +44,85 @@ func loadConfig() {
 	config.mu.Lock()
 	defer config.mu.Unlock()
 	config.TargetRedirect = cfg.Section("").Key("TARGET_REDIRECT").String()
+	config.BlockRedirect = cfg.Section("").Key("BLOCK_REDIRECT").String()
 }
 
 // updateConfig mengubah state di memory dan menyimpannya kembali ke settings.ini
-func updateConfig(newURL string) error {
+func updateConfig(newURL string, newBlockURL string) error {
 	cfg, err := ini.Load(configFile)
 	if err != nil {
 		return err
 	}
 
-	// Update memory (Thread-Safe)
 	config.mu.Lock()
-	config.TargetRedirect = newURL
+	if newURL != "" {
+		config.TargetRedirect = newURL
+		cfg.Section("").Key("TARGET_REDIRECT").SetValue(newURL)
+	}
+	if newBlockURL != "" {
+		config.BlockRedirect = newBlockURL
+		cfg.Section("").Key("BLOCK_REDIRECT").SetValue(newBlockURL)
+	}
 	config.mu.Unlock()
 
-	// Update file INI
-	cfg.Section("").Key("TARGET_REDIRECT").SetValue(newURL)
-	err = cfg.SaveTo(configFile)
+	return cfg.SaveTo(configFile)
+}
+
+// getClientIP mendapatkan IP asli client (mendukung jika ada di balik Nginx/Cloudflare)
+func getClientIP(r *http.Request) string {
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip != "" {
+		ips := strings.Split(ip, ",")
+		return strings.TrimSpace(ips[0])
+	}
+	ip = r.Header.Get("X-Real-IP")
+	if ip != "" {
+		return ip
+	}
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return err
+		return r.RemoteAddr
+	}
+	return ip
+}
+
+// checkBlackbox mengirim request ke API blackbox dengan timeout 10 detik
+func checkBlackbox(ip string) bool {
+	// Timeout setara dengan AbortSignal.timeout(10000)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	apiURL := fmt.Sprintf("https://blackbox.ipinfo.app/lookup/%s", url.PathEscape(ip))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return false
 	}
 
-	return nil
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+
+	result := strings.TrimSpace(string(bodyBytes))
+	return result == "Y"
 }
 
 // redirectHandler menangani endpoint /go
 func redirectHandler(w http.ResponseWriter, r *http.Request) {
 	config.mu.RLock()
 	targetURL := config.TargetRedirect
+	blockURL := config.BlockRedirect
 	config.mu.RUnlock()
 
 	if targetURL == "" {
@@ -74,7 +130,29 @@ func redirectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, targetURL, http.StatusFound)
+	ip := getClientIP(r)
+	isBlocked := checkBlackbox(ip)
+
+	// Tentukan base URL berdasarkan status block
+	finalURL := targetURL
+	if isBlocked && blockURL != "" {
+		finalURL = blockURL
+		log.Printf("[BLOCK] HTTP trigger function processing request for IP filter. %s\n", ip)
+	} else {
+		log.Printf("[PASS] HTTP trigger function processing request for IP filter. %s\n", ip)
+	}
+
+	// Teruskan searchParams (query string) jika ada
+	searchParams := r.URL.RawQuery
+	if searchParams != "" {
+		if strings.Contains(finalURL, "?") {
+			finalURL = finalURL + "&" + searchParams
+		} else {
+			finalURL = finalURL + "?" + searchParams
+		}
+	}
+
+	http.Redirect(w, r, finalURL, http.StatusFound)
 }
 
 // editHandler menangani endpoint /api/edit
@@ -83,21 +161,21 @@ func editHandler(w http.ResponseWriter, r *http.Request) {
 
 	apikey := r.URL.Query().Get("apikey")
 	newURL := r.URL.Query().Get("url")
+	newBlockURL := r.URL.Query().Get("block_url") // Opsional jika ingin update block link juga
 
-	if apikey == "" || newURL == "" {
+	if apikey == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Parameter 'apikey' dan 'url' wajib diisi"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Parameter 'apikey' wajib diisi"})
 		return
 	}
 
-	// Karena API Key dari env bersifat statis selama runtime, kita tidak perlu RLock untuk membacanya
 	if apikey != config.APIKey {
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]string{"error": "API Key tidak valid"})
 		return
 	}
 
-	err := updateConfig(newURL)
+	err := updateConfig(newURL, newBlockURL)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Gagal menyimpan konfigurasi: " + err.Error()})
@@ -106,8 +184,9 @@ func editHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Target redirect berhasil diupdate",
-		"new_url": newURL,
+		"message":       "Konfigurasi redirect berhasil diupdate",
+		"new_url":       newURL,
+		"new_block_url": newBlockURL,
 	})
 }
 
